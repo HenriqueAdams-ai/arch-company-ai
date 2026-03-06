@@ -8,6 +8,7 @@ chromadb
 gspread
 google-auth
 google-auth-oauthlib
+streamlit-oauth
 plotly
 pandas
 python-dotenv
