@@ -1,0 +1,28 @@
+# Arquivos sensiveis — NAO enviar ao GitHub
+.env
+minhas_chaves.txt
+
+# Memoria local (ChromaDB) — dados ficam no servidor
+memoria_arch_company/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Google credentials
+credentials.json
+token.json
+service_account.json
+
+# OS
+.DS_Store
+Thumbs.db
