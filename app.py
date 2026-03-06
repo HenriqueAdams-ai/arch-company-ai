@@ -3,7 +3,7 @@
 # ============================================================
 # Novidades v2.0:
 #   - Login/senha obrigatória (DASHBOARD_PASSWORD no Railway)
-#   - Chat com input no TOPO e mensagens do mais recente ao mais antigo
+#   - Chat com input no TOPO e mensagens do mais recente para o mais antigo
 #   - @menção aciona agente específico com o conteúdo digitado
 #   - Menção sem @ → agente atual pergunta se notifica o citado
 #   - Memória persistente por agente (MEMORY_PATH + pasta individual)
@@ -52,12 +52,59 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ════════════════════════════════════════════════════════════════
-# AUTH — TELA DE LOGIN (Intranet privada)
+# WHITELIST E AUTENTICAÇÃO GOOGLE OAUTH
 # ════════════════════════════════════════════════════════════════
-SENHA_ACESSO = os.environ.get("DASHBOARD_PASSWORD", "archcompany2026")
 
+def carregar_whitelist():
+    """Carrega lista de usuários autorizados do JSON"""
+    try:
+        # Tenta carregar de variável de ambiente primeiro (Railway)
+        whitelist_str = os.environ.get("USERS_WHITELIST")
+        if whitelist_str:
+            return json.loads(whitelist_str)
+
+        # Fallback: carrega do arquivo local
+        with open("users_whitelist.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Erro ao carregar whitelist: {e}")
+        return {"users": []}
+
+import json
+
+WHITELIST_DATA = carregar_whitelist()
+
+def encontrar_usuario(email):
+    """Procura usuário na whitelist"""
+    # Compatibilidade com ambos formatos (users ou usuarios_autorizados)
+    usuarios = WHITELIST_DATA.get("users") or WHITELIST_DATA.get("usuarios_autorizados", [])
+    for user in usuarios:
+        if user.get("email", "").lower() == email.lower() and user.get("status") != "inativo":
+            return user
+    return None
+
+def tem_permissao(usuario_perms, permissao):
+    """Verifica se usuário tem uma permissão específica"""
+    if not usuario_perms:
+        return False
+    # Compatibilidade com diferentes formatos
+    if isinstance(usuario_perms, list):
+        return permissao in usuario_perms
+    return usuario_perms.get(permissao, False)
+
+# ════════════════════════════════════════════════════════════════
+# SETUP SESSION STATE
+# ════════════════════════════════════════════════════════════════
 if "autenticado" not in st.session_state:
     st.session_state.autenticado = False
+    st.session_state.usuario_email = None
+    st.session_state.usuario_nome = None
+    st.session_state.usuario_role = None
+    st.session_state.usuario_permissoes = {}
+
+# ════════════════════════════════════════════════════════════════
+# GOOGLE OAUTH 2.0 + WHITELIST
+# ════════════════════════════════════════════════════════════════
 
 if not st.session_state.autenticado:
     col_l, col_c, col_r = st.columns([1, 2, 1])
@@ -66,23 +113,66 @@ if not st.session_state.autenticado:
         st.markdown("# 🏢 Arch Company AI")
         st.markdown("### Sistema de Inteligência Interna")
         st.markdown("---")
-        st.markdown("#### 🔐 Acesso Restrito — Colaboradores Autorizados")
+        st.markdown("#### 🔐 Login Seguro com Google")
         st.markdown("<br>", unsafe_allow_html=True)
-        senha_digitada = st.text_input(
-            "Senha de acesso",
-            type="password",
-            placeholder="Digite a senha de acesso...",
-            key="login_senha"
-        )
-        if st.button("🚀 Entrar no Sistema", use_container_width=True, type="primary"):
-            if senha_digitada == SENHA_ACESSO:
-                st.session_state.autenticado = True
-                st.rerun()
-            elif senha_digitada:
-                st.error("❌ Senha incorreta. Verifique com o administrador.")
+
+        # Google OAuth usando streamlit-oauth
+        try:
+            import streamlit_oauth
+            token = streamlit_oauth.OAuth2Component(
+                client_id=os.environ.get("GOOGLE_CLIENT_ID"),
+                client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
+                authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+                token_endpoint="https://oauth2.googleapis.com/token",
+                refresh_token_endpoint="https://oauth2.googleapis.com/token",
+                revoke_endpoint="https://oauth2.googleapis.com/revoke",
+                client_kwargs=dict(scope=["email", "profile"]),
+                is_local=False,
+            ).authorize_button(
+                name="sign_in_with",
+                icon="https://www.gstatic.com/firebaseapp.com/images/firebaselogo.png",
+                redirect_uri="https://web-production-c201.up.railway.app/",
+                key="google_oauth",
+                pkce="S256",
+            )
+
+            if token:
+                email = token["userinfo"]["email"]
+                nome = token["userinfo"]["name"]
+
+                # ✅ Verificar se está na whitelist
+                usuario = encontrar_usuario(email)
+
+                if usuario:
+                    # ✅ ACESSO CONCEDIDO
+                    st.session_state.autenticado = True
+                    st.session_state.usuario_email = email
+                    st.session_state.usuario_nome = nome
+                    st.session_state.usuario_role = usuario.get("role", "viewer")
+                    # Compatibilidade com diferentes formatos de permissões
+                    usuario_perms = usuario.get("permissions", usuario.get("permissoes", {}))
+                    st.session_state.usuario_permissoes = usuario_perms
+
+                    st.success(f"✅ Bem-vindo, {nome}!")
+                    st.balloons()
+                    st.rerun()
+                else:
+                    # ❌ ACESSO NEGADO
+                    st.error(f"❌ Acesso Negado")
+                    st.markdown(f"""
+                    Seu e-mail **{email}** não está autorizado a acessar o sistema.
+
+                    Entre em contato com o administrador:
+                    📧 **financeiro.archcodalmobile@gmail.com**
+                    """)
+        except Exception as e:
+            st.warning(f"⚠️ Erro ao conectar com Google: {e}")
+            st.info("Verifique se `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` estão configurados no Railway.")
+
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("---")
-        st.caption("🔒 Acesso restrito — Arch Company AI © 2026 | Henrique Adams")
+        st.caption("🔒 Login via Google OAuth 2.0 | Arch Company AI © 2026 | Henrique Adams")
+
     st.stop()
 
 # ════════════════════════════════════════════════════════════════
@@ -265,6 +355,7 @@ def construir_system_prompt(agente_key: str) -> str:
     Monta o system prompt incluindo:
     1. Personalidade base
     2. Personalidade/aprendizados persistidos no ChromaDB (se houver)
+    3. Contexto de memória relevante (para Memo-Engram, sempre; para outros, ao pedir)
     """
     base = SYSTEM_BASE.get(agente_key, SYSTEM_BASE["equipe"])
 
@@ -278,7 +369,7 @@ def construir_system_prompt(agente_key: str) -> str:
     if personalidade_salva:
         return (
             f"{base}\n\n"
-            f"=== SEUS APRENDIZADOS E MEMORIAS DE IDENTIDADE ===\n"
+            f"=== SEUS APRENDIZADOS E MEMÓRIAS DE IDENTIDADE ===\n"
             f"{personalidade_salva}\n"
             f"=== FIM DOS APRENDIZADOS ==="
         )
@@ -344,9 +435,17 @@ with st.sidebar:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Sair", key="sair_btn"):
             st.session_state.autenticado = False
+            st.session_state.usuario_email = None
+            st.session_state.usuario_nome = None
+            st.session_state.usuario_role = None
+            st.session_state.usuario_permissoes = {}
             st.rerun()
 
-    st.caption("🟢 Autenticado como Henrique Adams")
+    # Exibir informações do usuário autenticado
+    st.markdown(f"### 👤 {st.session_state.usuario_nome}")
+    st.markdown(f"**Email:** `{st.session_state.usuario_email}`")
+    st.markdown(f"**Role:** `{st.session_state.usuario_role.upper()}`")
+    st.caption(f"🟢 Autenticado via Google OAuth")
     st.markdown("---")
 
     st.markdown("### 🤖 Time de Agentes")
@@ -738,14 +837,40 @@ with tab_agentes:
 with tab_config:
     st.markdown("### 🔧 Configurações do Sistema")
 
-    # Segurança
-    st.markdown("#### 🔐 Senha de Acesso (Intranet)")
+    # Segurança — Google OAuth + Whitelist
+    st.markdown("#### 🔐 Autenticação — Google OAuth + Whitelist")
     st.info(
-        "A senha é definida pela variável de ambiente `DASHBOARD_PASSWORD` no Railway.\n\n"
-        "**Para alterar:**\n"
-        "Railway → seu serviço → Variables → `DASHBOARD_PASSWORD` = sua-nova-senha\n\n"
-        f"Senha padrão se não configurada: `archcompany2026`"
+        "Sistema de autenticação: **Google OAuth 2.0 com Whitelist de Usuários**\n\n"
+        "**Variáveis de Ambiente no Railway:**\n"
+        "- `GOOGLE_CLIENT_ID` — ID do cliente OAuth\n"
+        "- `GOOGLE_CLIENT_SECRET` — Secret do cliente OAuth\n"
+        "- `USERS_WHITELIST` — JSON com usuários autorizados\n\n"
+        "**Como adicionar novos usuários:**\n"
+        "1. Editar arquivo `users_whitelist.json` no GitHub\n"
+        "2. Adicionar nova entrada com email, nome, role e permissões\n"
+        "3. Deploy automático no Railway"
     )
+
+    # Exibir usuários autorizados
+    if st.session_state.usuario_role == "master":
+        st.markdown("#### 👥 Usuários Autorizados")
+        usuarios = WHITELIST_DATA.get("users", [])
+        if usuarios:
+            import pandas as pd
+            df_users = pd.DataFrame([
+                {
+                    "Email": u.get("email", "N/A"),
+                    "Nome": u.get("name", u.get("nome", "N/A")),
+                    "Role": u.get("role", "N/A"),
+                    "Status": "🟢 Ativo" if u.get("status") != "inativo" else "🔴 Inativo"
+                }
+                for u in usuarios
+            ])
+            st.dataframe(df_users, use_container_width=True, hide_index=True)
+        else:
+            st.warning("⚠️ Nenhum usuário configurado na whitelist")
+    else:
+        st.info(f"ℹ️ Você tem acesso em modo `{st.session_state.usuario_role.upper()}`. Contate o administrador para gerenciar usuários.")
 
     st.markdown("---")
 
@@ -789,9 +914,11 @@ with tab_config:
     st.markdown("---")
     st.markdown("#### 📋 Checklist de Configuração")
     steps = [
+        ("Google OAuth — CLIENT_ID",   bool(os.environ.get("GOOGLE_CLIENT_ID"))),
+        ("Google OAuth — CLIENT_SECRET", bool(os.environ.get("GOOGLE_CLIENT_SECRET"))),
+        ("Whitelist de Usuários",      bool(WHITELIST_DATA.get("users") or WHITELIST_DATA.get("usuarios_autorizados"))),
         ("API Key Anthropic (Claude)", bool(os.environ.get("ANTHROPIC_API_KEY"))),
         ("API Key xAI (Grok)",         bool(os.environ.get("XAI_API_KEY"))),
-        ("Senha do dashboard",         bool(os.environ.get("DASHBOARD_PASSWORD"))),
         ("Memória persistente (Volume)", bool(os.environ.get("MEMORY_PATH"))),
         ("Google Drive conectado",     False),
     ]
@@ -801,9 +928,14 @@ with tab_config:
     st.markdown("---")
     st.markdown("#### 🚀 Variáveis de ambiente no Railway")
     st.code(
-        "ANTHROPIC_API_KEY  = sk-ant-api03-...\n"
-        "XAI_API_KEY        = xai-...\n"
-        "DASHBOARD_PASSWORD = sua-senha-segura\n"
-        "MEMORY_PATH        = /data/memory   ← após criar o Volume",
+        "# Google OAuth (obrigatório)\n"
+        "GOOGLE_CLIENT_ID     = 197438474638-v3y7qiiphhayayrano5cco7yq6mhqq.apps.googleusercontent.com\n"
+        "GOOGLE_CLIENT_SECRET = GOCsIrX-eN6Gc2M_FuEdLJIQsQvhD9I6_gG\n"
+        "USERS_WHITELIST      = {\"users\": [{...}]}\n\n"
+        "# APIs (para agentes)\n"
+        "ANTHROPIC_API_KEY    = sk-ant-api03-...\n"
+        "XAI_API_KEY          = xai-...\n\n"
+        "# Memória persistente\n"
+        "MEMORY_PATH          = /data/memory   ← após criar o Volume",
         language="bash"
     )
