@@ -1,106 +1,159 @@
 # ============================================================
-# ARCH COMPANY AI — Sistema de Memória Persistente (Memo)
+# ARCH COMPANY AI — Sistema de Memória Persistente v2.0
 # ============================================================
-# Usa ChromaDB para armazenar e recuperar memórias da empresa.
-# Cada conversa, decisão e evento fica salvo em disco.
+# Cada agente tem sua própria coleção ChromaDB.
+# Os dados ficam em MEMORY_PATH (env var) ou em ./memoria_arch_company/
 #
-# Instalação necessária:
-#   pip install chromadb
+# Para Railway (memória persistente entre deploys):
+#   1. Railway Dashboard → Service → Volumes → montar em /data/memory
+#   2. Adicionar variável: MEMORY_PATH=/data/memory
+#
+# Coleções criadas:
+#   arch_archie, arch_finley, arch_xara, arch_shield,
+#   arch_memo,   arch_nexus,  arch_henrio, arch_nexo,
+#   arch_shared  (memória compartilhada — acessível por todos)
 # ============================================================
 
 import os
+import json
 import chromadb
-from chromadb.config import Settings
 from datetime import datetime
 from typing import Optional
 
-# ── Configuração do ChromaDB ──────────────────────────────
-# Os dados ficam salvos na pasta "memoria_arch_company"
-# ao lado do app.py — PERSISTENTE entre reinicializações
-PASTA_MEMORIA = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "memoria_arch_company"
+# ── Caminho da pasta de memória ───────────────────────────────
+# Usa variável de ambiente se disponível (Railway Volume)
+# Caso contrário, pasta local ao lado do app.py
+_BASE = os.path.dirname(os.path.abspath(__file__))
+PASTA_MEMORIA = os.environ.get(
+    "MEMORY_PATH",
+    os.path.join(_BASE, "memoria_arch_company")
 )
 
-_cliente_chroma = None
-_colecao_memo = None
+# ── Agentes disponíveis ───────────────────────────────────────
+AGENTES_VALIDOS = ["archie", "finley", "xara", "shield", "memo",
+                   "nexus", "henrio", "nexo", "shared", "sistema"]
+
+# ── Cache de clientes e coleções ──────────────────────────────
+_clientes: dict = {}
+_colecoes: dict = {}
 
 
-def _get_colecao():
-    """Inicializa (ou retorna) a coleção ChromaDB de memórias."""
-    global _cliente_chroma, _colecao_memo
-    if _colecao_memo is None:
-        _cliente_chroma = chromadb.PersistentClient(path=PASTA_MEMORIA)
-        _colecao_memo = _cliente_chroma.get_or_create_collection(
-            name="arch_company_memoria",
+def _get_colecao(agente: str = "shared"):
+    """
+    Retorna (ou inicializa) a coleção ChromaDB do agente.
+    Cada agente tem sua própria sub-pasta e coleção isolada.
+    """
+    global _clientes, _colecoes
+
+    # Normaliza o nome do agente
+    agente = agente.lower().strip()
+    if agente not in AGENTES_VALIDOS:
+        agente = "shared"
+
+    if agente not in _colecoes:
+        # Sub-pasta por agente: .../memoria_arch_company/archie/
+        pasta_agente = os.path.join(PASTA_MEMORIA, agente)
+        os.makedirs(pasta_agente, exist_ok=True)
+
+        _clientes[agente] = chromadb.PersistentClient(path=pasta_agente)
+        _colecoes[agente] = _clientes[agente].get_or_create_collection(
+            name=f"arch_{agente}",
             metadata={"hnsw:space": "cosine"}
         )
-    return _colecao_memo
+
+    return _colecoes[agente]
 
 
-# ── Salvar memória ────────────────────────────────────────
+# ── Salvar memória ────────────────────────────────────────────
 def salvar_memoria(
     conteudo: str,
     tipo: str = "conversa",
-    agente: str = "sistema",
-    tags: Optional[list] = None
+    agente: str = "shared",
+    tags: Optional[list] = None,
+    salvar_shared: bool = True,
 ) -> str:
     """
-    Salva uma memória no ChromaDB.
+    Salva uma memória na coleção do agente E (opcionalmente) na coleção shared.
 
     Args:
-        conteudo: texto da memória (pergunta + resposta, decisão, etc.)
-        tipo: "conversa" | "decisao" | "relatorio" | "evento" | "nota"
-        agente: nome do agente que gerou a memória
-        tags: lista de tags opcionais para filtro
+        conteudo:     texto completo a salvar
+        tipo:         "conversa" | "decisao" | "relatorio" | "evento" | "nota" | "personalidade"
+        agente:       nome do agente dono da memória
+        tags:         lista de tags opcionais
+        salvar_shared: se True, salva também em arch_shared (visível para todos)
 
     Returns:
         ID da memória salva
     """
-    colecao = _get_colecao()
+    agente = agente.lower().strip()
     agora = datetime.now()
     memoria_id = f"{tipo}_{agente}_{agora.strftime('%Y%m%d_%H%M%S_%f')}"
 
-    colecao.add(
+    meta = {
+        "tipo":   tipo,
+        "agente": agente,
+        "data":   agora.strftime("%d/%m/%Y"),
+        "hora":   agora.strftime("%H:%M"),
+        "tags":   ", ".join(tags) if tags else "",
+    }
+
+    # Salva na coleção própria do agente
+    colecao_agente = _get_colecao(agente)
+    colecao_agente.add(
         documents=[conteudo],
         ids=[memoria_id],
-        metadatas=[{
-            "tipo": tipo,
-            "agente": agente,
-            "data": agora.strftime("%d/%m/%Y"),
-            "hora": agora.strftime("%H:%M"),
-            "tags": ", ".join(tags) if tags else "",
-        }]
+        metadatas=[meta],
     )
+
+    # Salva também em shared para acesso cruzado
+    if salvar_shared and agente not in ("shared", "sistema"):
+        colecao_shared = _get_colecao("shared")
+        colecao_shared.add(
+            documents=[conteudo],
+            ids=[f"shared_{memoria_id}"],
+            metadatas=[meta],
+        )
+
     return memoria_id
 
 
-# ── Buscar memórias ───────────────────────────────────────
+def salvar_personalidade(agente: str, personalidade: str) -> str:
+    """
+    Salva/atualiza a personalidade e aprendizados de um agente.
+    Tipo especial 'personalidade' — sobrescreve o anterior.
+    """
+    return salvar_memoria(
+        conteudo=personalidade,
+        tipo="personalidade",
+        agente=agente,
+        tags=["personalidade", "identidade"],
+        salvar_shared=False,  # personalidade é privada ao agente
+    )
+
+
+# ── Buscar memórias ───────────────────────────────────────────
 def buscar_memorias(
     consulta: str,
     n_resultados: int = 5,
-    tipo: Optional[str] = None
+    tipo: Optional[str] = None,
+    agente: Optional[str] = None,
 ) -> list[dict]:
     """
     Busca memórias relevantes por similaridade semântica.
 
     Args:
-        consulta: texto de busca
+        consulta:     texto de busca
         n_resultados: quantas memórias retornar
-        tipo: filtrar por tipo ("conversa", "decisao", etc.) — opcional
-
-    Returns:
-        Lista de dicionários com conteúdo e metadados
+        tipo:         filtrar por tipo (opcional)
+        agente:       se informado, busca APENAS na coleção desse agente;
+                      se None, busca na coleção shared (visão geral)
     """
-    colecao = _get_colecao()
-
-    # Verifica se há memórias
+    colecao = _get_colecao(agente if agente else "shared")
     total = colecao.count()
     if total == 0:
         return []
 
     n_resultados = min(n_resultados, total)
-
     kwargs = {
         "query_texts": [consulta],
         "n_results": n_resultados,
@@ -109,60 +162,55 @@ def buscar_memorias(
         kwargs["where"] = {"tipo": tipo}
 
     resultados = colecao.query(**kwargs)
-
     memorias = []
     for i, doc in enumerate(resultados["documents"][0]):
         meta = resultados["metadatas"][0][i]
         memorias.append({
             "conteudo": doc,
-            "tipo": meta.get("tipo", ""),
-            "agente": meta.get("agente", ""),
-            "data": meta.get("data", ""),
-            "hora": meta.get("hora", ""),
-            "tags": meta.get("tags", ""),
+            "tipo":     meta.get("tipo", ""),
+            "agente":   meta.get("agente", ""),
+            "data":     meta.get("data", ""),
+            "hora":     meta.get("hora", ""),
+            "tags":     meta.get("tags", ""),
         })
     return memorias
 
 
-# ── Listar memórias recentes ──────────────────────────────
-def listar_memorias_recentes(n: int = 10) -> list[dict]:
-    """Retorna as últimas N memórias salvas."""
-    colecao = _get_colecao()
+def listar_memorias_recentes(n: int = 10, agente: Optional[str] = None) -> list[dict]:
+    """Retorna as últimas N memórias (do agente específico ou shared)."""
+    colecao = _get_colecao(agente if agente else "shared")
     total = colecao.count()
     if total == 0:
         return []
 
-    # Busca todas e pega as mais recentes (ChromaDB não tem ORDER BY nativo)
     todos = colecao.get(include=["documents", "metadatas"])
     memorias = []
     for i, doc in enumerate(todos["documents"]):
         meta = todos["metadatas"][i]
         memorias.append({
             "conteudo": doc,
-            "tipo": meta.get("tipo", ""),
-            "agente": meta.get("agente", ""),
-            "data": meta.get("data", ""),
-            "hora": meta.get("hora", ""),
+            "tipo":     meta.get("tipo", ""),
+            "agente":   meta.get("agente", ""),
+            "data":     meta.get("data", ""),
+            "hora":     meta.get("hora", ""),
         })
 
-    # Ordena por data/hora (mais recente primeiro)
     memorias.sort(key=lambda x: f"{x['data']} {x['hora']}", reverse=True)
     return memorias[:n]
 
 
-# ── Total de memórias ─────────────────────────────────────
-def total_memorias() -> int:
-    """Retorna quantas memórias estão armazenadas."""
-    return _get_colecao().count()
+def total_memorias(agente: Optional[str] = None) -> int:
+    """Conta memórias (do agente específico ou shared)."""
+    return _get_colecao(agente if agente else "shared").count()
 
 
-# ── Formatar contexto para o agente Memo ─────────────────
-def formatar_contexto_memo(consulta: str) -> str:
+def formatar_contexto_memo(consulta: str, agente: Optional[str] = None) -> str:
     """
-    Busca memórias relevantes e formata como contexto
-    para o agente Memo responder com base no histórico real.
+    Busca memórias relevantes e formata como contexto.
+    Se agente informado: busca memórias daquele agente.
+    Caso contrário: busca na coleção shared.
     """
-    memorias = buscar_memorias(consulta, n_resultados=5)
+    memorias = buscar_memorias(consulta, n_resultados=5, agente=agente)
     if not memorias:
         return "Nenhuma memória encontrada ainda. Este é o início do histórico da Arch Company."
 
@@ -175,42 +223,56 @@ def formatar_contexto_memo(consulta: str) -> str:
     return "\n".join(linhas)
 
 
-# ── Teste rápido ──────────────────────────────────────────
+def carregar_personalidade(agente: str) -> str:
+    """
+    Carrega a personalidade/aprendizados mais recente do agente.
+    Retorna string vazia se não houver nenhuma salva.
+    """
+    memorias = buscar_memorias(
+        consulta="personalidade identidade aprendizado",
+        n_resultados=3,
+        tipo="personalidade",
+        agente=agente,
+    )
+    if not memorias:
+        return ""
+    # Retorna a mais relevante
+    return memorias[0]["conteudo"]
+
+
+# ── Estatísticas por agente ───────────────────────────────────
+def stats_memorias() -> dict:
+    """Retorna um dicionário com count de memórias por agente."""
+    stats = {}
+    for ag in AGENTES_VALIDOS:
+        try:
+            stats[ag] = _get_colecao(ag).count()
+        except Exception:
+            stats[ag] = 0
+    return stats
+
+
+# ── Teste rápido ──────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=== TESTE DO SISTEMA DE MEMÓRIA ===\n")
+    print(f"=== TESTE — MEMÓRIA POR AGENTE ===")
+    print(f"Pasta de memória: {PASTA_MEMORIA}\n")
 
-    # Salvar algumas memórias de teste
-    id1 = salvar_memoria(
-        "Henrique decidiu focar em clientes do setor de tecnologia em março/2026.",
-        tipo="decisao",
-        agente="archie",
-        tags=["estrategia", "clientes", "2026"]
+    # Salvar personalidade do Archie
+    salvar_personalidade(
+        "archie",
+        "Sou Archie-Solomon, CEO da Arch Company. Fui criado em 06/03/2026 por Henrique Adams. "
+        "Meu caráter é fundamentado em sabedoria, visão estratégica e integridade. "
+        "Aprendi que decisões rápidas sem integridade destroem empresas."
     )
-    print(f"✅ Memória salva: {id1}")
+    print("✅ Personalidade do Archie salva")
 
-    id2 = salvar_memoria(
-        "Receita de fevereiro/2026: R$ 45.200. Despesas: R$ 28.100. Lucro: R$ 17.100.",
-        tipo="relatorio",
-        agente="finley",
-        tags=["financeiro", "fevereiro", "2026"]
-    )
-    print(f"✅ Memória salva: {id2}")
-
-    id3 = salvar_memoria(
-        "Usuário perguntou: Como está o caixa da empresa? "
-        "Henrio respondeu: O caixa está em R$ 32.400, com alta de 8% no mês.",
+    # Salvar memória de conversa
+    salvar_memoria(
+        conteudo="Henrique perguntou sobre estratégia de crescimento. Recomendei foco em clientes enterprise.",
         tipo="conversa",
-        agente="henrio",
-        tags=["caixa", "financeiro"]
+        agente="archie",
+        tags=["estrategia", "crescimento"]
     )
-    print(f"✅ Memória salva: {id3}")
-
-    print(f"\nTotal de memórias: {total_memorias()}")
-
-    # Buscar por relevância
-    print("\n=== BUSCANDO: 'receita e lucro' ===")
-    resultados = buscar_memorias("receita e lucro da empresa")
-    for r in resultados:
-        print(f"  [{r['tipo']}] {r['data']} — {r['conteudo'][:100]}...")
-
-    print("\n✅ Sistema de memória funcionando!")
+    print(f"✅ Total Archie: {total_memorias('archie')}")
+    print(f"✅ Total Shared: {total_memorias('shared')}")
+    print(f"\nEstatísticas: {stats_memorias()}")
