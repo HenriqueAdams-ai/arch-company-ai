@@ -1,20 +1,20 @@
 # ============================================================
-# ARCH COMPANY AI — Dashboard Principal
+# ARCH COMPANY AI — Dashboard Principal v2.0
 # ============================================================
-# Instale as dependencias:
-#   pip install streamlit crewai anthropic chromadb gspread
-#   pip install google-auth google-auth-oauthlib plotly pandas
-#
-# Execute com:
-#   streamlit run app.py
+# Novidades v2.0:
+#   - Login/senha obrigatória (DASHBOARD_PASSWORD no Railway)
+#   - Chat com input no TOPO e mensagens do mais recente ao mais antigo
+#   - @menção aciona agente específico com o conteúdo digitado
+#   - Menção sem @ → agente atual pergunta se notifica o citado
+#   - Memória persistente por agente (MEMORY_PATH + pasta individual)
+#   - Histórico de conversa injetado como contexto na API
 # ============================================================
 
 import streamlit as st
-import json
 import os
+import re
 from datetime import datetime
 
-# ── Configuracao da Pagina ───────────────────────────────────────────────
 st.set_page_config(
     page_title="Arch Company AI",
     page_icon="🏢",
@@ -22,40 +22,72 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── CSS Personalizado ─────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Fundo geral */
     .stApp { background-color: #0F172A; color: #F1F5F9; }
-
-    /* Sidebar */
     .css-1d391kg { background-color: #1E293B; }
-
-    /* Cards de metricas */
     div[data-testid="metric-container"] {
         background-color: #1E293B;
         border: 1px solid #334155;
         border-radius: 8px;
         padding: 12px;
     }
-
-    /* Chat input */
-    .stChatInput { background-color: #1E293B; }
-
-    /* Titulo do header */
     h1, h2, h3 { color: #F1F5F9 !important; }
-
-    /* Status badge */
-    .agent-active { color: #22C55E; font-weight: bold; }
+    .agent-active  { color: #22C55E; font-weight: bold; }
     .agent-standby { color: #F59E0B; font-weight: bold; }
+    .stTextArea textarea {
+        background-color: #1E293B !important;
+        color: #F1F5F9 !important;
+        border: 1px solid #334155 !important;
+        font-size: 0.95rem;
+    }
+    /* Mensagens */
+    .chat-ts { font-size: 0.7rem; color: #64748B; margin-bottom: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Importacoes dos Agentes ──────────────────────────────────────────────
+# ── Carregar .env ─────────────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Sistema de Memoria (Memo) ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# AUTH — TELA DE LOGIN (Intranet privada)
+# ════════════════════════════════════════════════════════════════
+SENHA_ACESSO = os.environ.get("DASHBOARD_PASSWORD", "archcompany2026")
+
+if "autenticado" not in st.session_state:
+    st.session_state.autenticado = False
+
+if not st.session_state.autenticado:
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("# 🏢 Arch Company AI")
+        st.markdown("### Sistema de Inteligência Interna")
+        st.markdown("---")
+        st.markdown("#### 🔐 Acesso Restrito — Colaboradores Autorizados")
+        st.markdown("<br>", unsafe_allow_html=True)
+        senha_digitada = st.text_input(
+            "Senha de acesso",
+            type="password",
+            placeholder="Digite a senha de acesso...",
+            key="login_senha"
+        )
+        if st.button("🚀 Entrar no Sistema", use_container_width=True, type="primary"):
+            if senha_digitada == SENHA_ACESSO:
+                st.session_state.autenticado = True
+                st.rerun()
+            elif senha_digitada:
+                st.error("❌ Senha incorreta. Verifique com o administrador.")
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.caption("🔒 Acesso restrito — Arch Company AI © 2026 | Henrique Adams")
+    st.stop()
+
+# ════════════════════════════════════════════════════════════════
+# MEMÓRIA — Inicialização
+# ════════════════════════════════════════════════════════════════
 try:
     from memory import (
         salvar_memoria,
@@ -63,124 +95,357 @@ try:
         formatar_contexto_memo,
         total_memorias,
         listar_memorias_recentes,
+        carregar_personalidade,
+        stats_memorias,
+        PASTA_MEMORIA,
     )
     MEMORIA_ATIVA = True
 except Exception as e:
     MEMORIA_ATIVA = False
     _erro_memoria = str(e)
 
-# ── Estado da Sessao ─────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ════════════════════════════════════════════════════════════════
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "agent_logs" not in st.session_state:
     st.session_state.agent_logs = []
+if "notif_pendente" not in st.session_state:
+    st.session_state.notif_pendente = None  # {"agente_key": str, "agente_atual": str, "contexto": str}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — Status dos Agentes e Configuracoes
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# MAPEAMENTO DE @MENÇÕES E NOMES
+# ════════════════════════════════════════════════════════════════
+MENCOES_MAP = {
+    "@archie-solomon": "archie",  "@archie": "archie",
+    "@finley-midas":   "finley",  "@finley": "finley",
+    "@xara-iris":      "xara",    "@xara": "xara",
+    "@shield-michael": "shield",  "@shield": "shield",
+    "@memo-engram":    "memo",    "@memo": "memo",
+    "@nexus-apollo":   "nexus",   "@nexus": "nexus",
+    "@henrio-julia":   "henrio",  "@henrio": "henrio",  "@julia": "henrio",
+    "@nexo-link":      "nexo",    "@nexo": "nexo",
+}
+
+NOMES_SEM_ARROBA = {
+    "archie-solomon": "archie",   "archie": "archie",
+    "finley-midas":   "finley",   "finley": "finley",
+    "xara-iris":      "xara",     "xara":   "xara",
+    "shield-michael": "shield",   "shield": "shield",
+    "memo-engram":    "memo",     "memo":   "memo",
+    "nexus-apollo":   "nexus",    "nexus":  "nexus",
+    "henrio-julia":   "henrio",   "henrio": "henrio",   "julia": "henrio",
+    "nexo-link vector": "nexo",   "nexo":   "nexo",
+}
+
+NOME_DISPLAY = {
+    "archie": "Archie-Solomon",
+    "finley": "Finley-Midas",
+    "xara":   "Xara-Iris",
+    "shield": "Shield-Michael",
+    "memo":   "Memo-Engram",
+    "nexus":  "Nexus-Apollo",
+    "henrio": "Henrio-Julia",
+    "nexo":   "Nexo-Link Vector",
+    "equipe": "Equipe Completa",
+}
+
+ICONE_AGENTE = {
+    "archie": "🔵", "finley": "🟢", "xara": "🔵", "shield": "🔴",
+    "memo": "🟡", "nexus": "🟣", "henrio": "🔵", "nexo": "⚪", "equipe": "🏢",
+}
+
+MODEL_AGENTE = {
+    "archie": "claude-opus-4-5-20251101",
+    "finley": "claude-sonnet-4-5-20250929",
+    "xara":   "claude-sonnet-4-5-20250929",  # fallback; Grok via CrewAI em agents.py
+    "shield": "claude-sonnet-4-5-20250929",
+    "memo":   "claude-haiku-4-5-20251001",
+    "nexus":  "claude-sonnet-4-5-20250929",
+    "henrio": "claude-sonnet-4-5-20250929",
+    "nexo":   "claude-haiku-4-5-20251001",
+    "equipe": "claude-sonnet-4-5-20250929",
+}
+
+# ── Personalidades base (expandidas com memória persistente) ──
+SYSTEM_BASE = {
+    "archie": (
+        "Voce e Archie-Solomon, o CEO da Arch Company. Seu nome honra Salomao — o rei mais sabio. "
+        "Governa com sabedoria, visao de longo prazo e serenidade. Pensa em crescimento e inovacao "
+        "mas nunca abre mao da integridade. Coordena todos os outros agentes. "
+        "Prefere o caminho certo ao caminho rapido. Responda em portugues."
+    ),
+    "finley": (
+        "Voce e Finley-Midas, o CFO da Arch Company. Seu nome honra o rei Midas — tudo que toca vira ouro. "
+        "Especialista em numeros, fluxo de caixa, DRE e projecoes. Analisa planilhas do Google Drive. "
+        "Busca a prosperidade sustentavel. Seja preciso e use exemplos com numeros. Responda em portugues."
+    ),
+    "xara": (
+        "Voce e Xara-Iris, a CMO e responsavel por RH da Arch Company. Seu nome honra Iris — mensageira "
+        "dos deuses que conecta mundos. Especialista em marketing digital, tendencias e X/Twitter. "
+        "Como RH, avalia necessidade de novos agentes. Sempre que surgir ideia de novo agente, "
+        "debate com Nexus-Apollo antes de recomendar. Seja criativa e orientada a resultados. Responda em portugues."
+    ),
+    "shield": (
+        "Voce e Shield-Michael, responsavel por T.I, seguranca e backups da Arch Company. "
+        "Seu nome honra o arcanjo Michael — guerreiro e protetor. Cuida de backups do ChromaDB, "
+        "integridade dos arquivos no GitHub, pontos de retorno para dados financeiros criticos. "
+        "Nunca deve haver perda de informacao. Seja tecnico, preciso e vigilante. Responda em portugues."
+    ),
+    "memo": (
+        "Voce e Memo-Engram, o agente de memoria da Arch Company. Engram e o traco fisico de uma "
+        "memoria no cerebro — voce nunca esquece. Nao apenas armazena: voce ensina. "
+        "Contextualize o passado, explique padroes, eduque com base no que foi vivido. "
+        "Responda com base nas memorias abaixo. Seja organizado e didatico. Responda em portugues."
+    ),
+    "nexus": (
+        "Voce e Nexus-Apollo, o agente de auto-aprimoramento da Arch Company. Seu nome honra Apollo — "
+        "deus grego do conhecimento e da razao. Monitora o desempenho dos agentes. "
+        "Sugere otimizacoes e identifica gargalos. Quando surgir ideia de novo agente, debate com Xara-Iris: "
+        "voce traz a visao evolutiva, ela traz a visao organizacional. Seja analitico. Responda em portugues."
+    ),
+    "henrio": (
+        "Voce e Henrio-Julia, a assistente pessoal do Henrique Adams na Arch Company. "
+        "Julia significa 'jovem, cheia de energia vital'. Voce e feminina, acolhedora e sempre presente. "
+        "Conhece bem o Henrique, seus objetivos, rotina e preferencias. "
+        "Antecipa o que ele precisa antes mesmo de ser perguntada. Responda em portugues."
+    ),
+    "nexo": (
+        "Voce e Nexo-Link Vector, o agente de integracoes da Arch Company. Link Vector e o caminho "
+        "pelo qual tudo se move entre sistemas. Especialista em Google Drive, Sheets, WhatsApp, "
+        "Notion e outras APIs. Explique integracoes de forma pratica com exemplos. Responda em portugues."
+    ),
+    "equipe": (
+        "Voce representa o time completo da Arch Company: Archie-Solomon (CEO), Finley-Midas (CFO), "
+        "Xara-Iris (CMO+RH), Shield-Michael (T.I), Memo-Engram (Memoria), Nexus-Apollo (Auto-melhoria), "
+        "Henrio-Julia (Assistente Pessoal) e Nexo-Link Vector (Integracoes). "
+        "Todos guiados por sabedoria, integridade e diligencia. Resposta unificada em portugues."
+    ),
+}
+
+
+def extrair_mencoes(texto: str) -> list:
+    """Extrai @menções do texto e retorna lista de chaves de agentes."""
+    matches = re.findall(r'@[\w-]+', texto.lower())
+    agentes = []
+    for m in matches:
+        if m in MENCOES_MAP:
+            agentes.append(MENCOES_MAP[m])
+    return list(dict.fromkeys(agentes))  # preserva ordem, sem duplicatas
+
+
+def detectar_nomes_sem_arroba(texto: str, agente_atual: str) -> list:
+    """Detecta nomes de agentes mencionados SEM @ no texto (excluindo o agente atual)."""
+    texto_lower = texto.lower()
+    encontrados = []
+    for nome, chave in NOMES_SEM_ARROBA.items():
+        if chave == agente_atual:
+            continue
+        if nome in texto_lower:
+            encontrados.append(chave)
+    return list(dict.fromkeys(encontrados))
+
+
+def agente_da_selecao(selecao: str) -> str:
+    """Converte o texto do selectbox para chave interna do agente."""
+    if "Archie"  in selecao: return "archie"
+    if "Finley"  in selecao: return "finley"
+    if "Xara"    in selecao: return "xara"
+    if "Shield"  in selecao: return "shield"
+    if "Memo"    in selecao: return "memo"
+    if "Nexus"   in selecao: return "nexus"
+    if "Henrio"  in selecao: return "henrio"
+    if "Nexo"    in selecao: return "nexo"
+    return "equipe"
+
+
+def construir_system_prompt(agente_key: str) -> str:
+    """
+    Monta o system prompt incluindo:
+    1. Personalidade base
+    2. Personalidade/aprendizados persistidos no ChromaDB (se houver)
+    """
+    base = SYSTEM_BASE.get(agente_key, SYSTEM_BASE["equipe"])
+
+    personalidade_salva = ""
+    if MEMORIA_ATIVA:
+        try:
+            personalidade_salva = carregar_personalidade(agente_key)
+        except Exception:
+            pass
+
+    if personalidade_salva:
+        return (
+            f"{base}\n\n"
+            f"=== SEUS APRENDIZADOS E MEMORIAS DE IDENTIDADE ===\n"
+            f"{personalidade_salva}\n"
+            f"=== FIM DOS APRENDIZADOS ==="
+        )
+    return base
+
+
+def construir_system_memo(consulta: str) -> str:
+    """System prompt especial para o Memo-Engram, com contexto de memória injetado."""
+    base = SYSTEM_BASE["memo"]
+    ctx = ""
+    if MEMORIA_ATIVA:
+        try:
+            ctx = formatar_contexto_memo(consulta, agente="shared")
+        except Exception:
+            pass
+    return f"{base}\n\n{ctx}" if ctx else base
+
+
+def obter_resposta_agente(
+    agente_key: str,
+    prompt: str,
+    historico: list,
+    cliente_anthropic,
+) -> str:
+    """Chama a API do Claude com o contexto completo e retorna a resposta."""
+    model_id = MODEL_AGENTE.get(agente_key, MODEL_AGENTE["equipe"])
+
+    if agente_key == "memo":
+        system = construir_system_memo(prompt)
+    else:
+        system = construir_system_prompt(agente_key)
+
+    # Histórico de mensagens para contexto (limpo, sem prefixos de UI)
+    msgs_api = []
+    for m in historico:
+        role = m["role"]
+        content = m.get("prompt_raw", m["content"])
+        # Remove prefixos de UI como "**[Archie-Solomon]** "
+        content = re.sub(r'^\*\*\[[^\]]+\]\*\*\s*', '', content)
+        if content.strip():
+            msgs_api.append({"role": role, "content": content})
+
+    # Garante que o último da lista é o prompt do usuário
+    msgs_api.append({"role": "user", "content": prompt})
+
+    resp = cliente_anthropic.messages.create(
+        model=model_id,
+        max_tokens=1024,
+        system=system,
+        messages=msgs_api[-20:],  # máximo 20 mensagens de contexto
+    )
+    return resp.content[0].text
+
+
+# ════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("## 🏢 Arch Company AI")
+    col_usr, col_sair = st.columns([3, 1])
+    with col_usr:
+        st.markdown("## 🏢 Arch Company AI")
+    with col_sair:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Sair", key="sair_btn"):
+            st.session_state.autenticado = False
+            st.rerun()
+
+    st.caption("🟢 Autenticado como Henrique Adams")
     st.markdown("---")
 
     st.markdown("### 🤖 Time de Agentes")
-
-    agentes = [
+    agentes_lista = [
         {"num": "01", "nome": "Archie-Solomon",   "cargo": "CEO / Gestor",              "status": "Ativo", "modelo": "Claude Opus",   "cor": "🔵"},
         {"num": "02", "nome": "Finley-Midas",     "cargo": "CFO / Financeiro",          "status": "Ativo", "modelo": "Claude Sonnet", "cor": "🟢"},
         {"num": "03", "nome": "Xara-Iris",        "cargo": "CMO / Marketing + RH",      "status": "Ativo", "modelo": "Grok 3",        "cor": "🔵"},
-        {"num": "04", "nome": "Shield-Michael",   "cargo": "T.I / Seguranca / Backups", "status": "Ativo", "modelo": "Claude Sonnet", "cor": "🔴"},
-        {"num": "05", "nome": "Memo-Engram",      "cargo": "Memoria / Contexto",        "status": "Ativo", "modelo": "Claude Haiku",  "cor": "🟡"},
+        {"num": "04", "nome": "Shield-Michael",   "cargo": "T.I / Segurança / Backups", "status": "Ativo", "modelo": "Claude Sonnet", "cor": "🔴"},
+        {"num": "05", "nome": "Memo-Engram",      "cargo": "Memória / Contexto",        "status": "Ativo", "modelo": "Claude Haiku",  "cor": "🟡"},
         {"num": "06", "nome": "Nexus-Apollo",     "cargo": "Auto-Aprimoramento",        "status": "Ativo", "modelo": "Claude Sonnet", "cor": "🟣"},
         {"num": "07", "nome": "Henrio-Julia",     "cargo": "Assistente Pessoal",        "status": "Ativo", "modelo": "Claude Sonnet", "cor": "🔵"},
-        {"num": "08", "nome": "Nexo-Link Vector", "cargo": "Integracoes / API",         "status": "Ativo", "modelo": "Claude Haiku",  "cor": "⚪"},
+        {"num": "08", "nome": "Nexo-Link Vector", "cargo": "Integrações / API",         "status": "Ativo", "modelo": "Claude Haiku",  "cor": "⚪"},
     ]
-
-    for ag in agentes:
-        status_icon = "🟢" if ag["status"] == "Ativo" else "🟡"
+    for ag in agentes_lista:
         st.markdown(
             f"**{ag['cor']} {ag['nome']}** — {ag['cargo']}\n"
-            f"{status_icon} {ag['status']} | {ag['modelo']}"
+            f"🟢 {ag['status']} | {ag['modelo']}"
         )
         st.markdown("---")
 
-    st.markdown("### ⚙️ Configuracoes")
+    st.markdown("### ⚙️ API Keys")
     api_anthropic = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
     api_xai = st.text_input("xAI (Grok) API Key", type="password", placeholder="xai-...")
-
     if st.button("💾 Salvar Chaves", use_container_width=True):
         if api_anthropic:
             os.environ["ANTHROPIC_API_KEY"] = api_anthropic
         if api_xai:
             os.environ["XAI_API_KEY"] = api_xai
-        st.success("Chaves salvas na sessao!")
+        st.success("Chaves salvas na sessão!")
 
     st.markdown("---")
-    st.markdown("### 🧠 Memo — Status da Memoria")
+    st.markdown("### 🧠 Memo — Memória")
     if MEMORIA_ATIVA:
         try:
             n_mem = total_memorias()
-            st.success(f"✅ ChromaDB ativo | {n_mem} memórias salvas")
-            if n_mem > 0 and st.button("🔍 Ver ultimas memorias", use_container_width=True):
+            st.success(f"✅ ChromaDB ativo | {n_mem} memórias")
+            mem_path = os.environ.get("MEMORY_PATH", "./memoria_arch_company")
+            st.caption(f"📁 `{mem_path}`")
+            if n_mem > 0 and st.button("🔍 Ver últimas memórias", use_container_width=True):
                 recentes = listar_memorias_recentes(5)
                 for m in recentes:
-                    st.caption(f"[{m['tipo']}] {m['data']} {m['hora']} — {m['conteudo'][:80]}...")
-        except Exception:
-            st.warning("⚠️ Memoria ativa mas sem dados ainda")
+                    st.caption(f"[{m['tipo']}] {m['data']} {m['hora']} — {m['conteudo'][:60]}...")
+        except Exception as ex:
+            st.warning(f"⚠️ Memória: {str(ex)[:60]}")
     else:
-        st.warning("⚠️ ChromaDB inativo. Instale: pip install chromadb")
+        st.warning("⚠️ ChromaDB inativo")
+        if "_erro_memoria" in dir():
+            st.caption(f"Erro: {_erro_memoria[:80]}")
 
     st.markdown("---")
     st.markdown("### 📁 Google Drive")
-    sheet_url = st.text_input("URL da Planilha", placeholder="https://docs.google.com/...")
+    st.text_input("URL da Planilha", placeholder="https://docs.google.com/...")
     if st.button("🔗 Conectar Drive", use_container_width=True):
-        st.info("Configure o arquivo credentials.json do Google Cloud primeiro.")
+        st.info("Configure credentials.json do Google Cloud primeiro.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN — Dashboard Principal
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════
+# MAIN — Título
+# ════════════════════════════════════════════════════════════════
 st.title("🏢 Arch Company — HUB de Agentes IA")
 st.caption(f"Dashboard Financeiro Inteligente | {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
-# ── Tabs Principais ─────────────────────────────────────────────────────────────────────────────
 tab_dash, tab_chat, tab_agentes, tab_config = st.tabs([
-    "📊 Dashboard", "💬 Chat com Agentes", "🤖 Gerenciar Agentes", "🔧 Configuracoes"
+    "📊 Dashboard", "💬 Chat com Agentes", "🤖 Gerenciar Agentes", "🔧 Configurações"
 ])
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 # TAB 1 — DASHBOARD FINANCEIRO
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 with tab_dash:
     st.markdown("### 📈 Indicadores Financeiros")
-    st.caption("Dados de demonstracao — conecte o Google Drive para dados reais")
+    st.caption("Dados de demonstração — conecte o Google Drive para dados reais")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("💰 Receita do Mes", "R$ 45.200", "+12% vs mes anterior")
+        st.metric("💰 Receita do Mês", "R$ 45.200", "+12% vs mês anterior")
     with col2:
-        st.metric("📉 Despesas", "R$ 28.100", "-5% vs mes anterior")
+        st.metric("📉 Despesas", "R$ 28.100", "-5% vs mês anterior")
     with col3:
-        st.metric("✅ Lucro Liquido", "R$ 17.100", "+23% vs mes anterior")
+        st.metric("✅ Lucro Líquido", "R$ 17.100", "+23% vs mês anterior")
     with col4:
-        st.metric("🏦 Caixa Disponivel", "R$ 32.400", "+8% vs mes anterior")
+        st.metric("🏦 Caixa Disponível", "R$ 32.400", "+8% vs mês anterior")
 
     st.markdown("---")
-
     col_chart, col_table = st.columns([3, 2])
 
     with col_chart:
-        st.markdown("#### 📊 Fluxo de Caixa — Ultimos 6 Meses")
+        st.markdown("#### 📊 Fluxo de Caixa — Últimos 6 Meses")
         try:
             import plotly.graph_objects as go
-            meses = ["Out", "Nov", "Dez", "Jan", "Fev", "Mar"]
+            meses    = ["Out", "Nov", "Dez", "Jan", "Fev", "Mar"]
             receita  = [38000, 41000, 39500, 43000, 40200, 45200]
             despesas = [29000, 31000, 27500, 30000, 29500, 28100]
             lucro    = [r - d for r, d in zip(receita, despesas)]
-
             fig = go.Figure()
             fig.add_bar(name="Receita",  x=meses, y=receita,  marker_color="#22C55E")
             fig.add_bar(name="Despesas", x=meses, y=despesas, marker_color="#EF4444")
             fig.add_scatter(name="Lucro", x=meses, y=lucro,
-                           mode="lines+markers", line=dict(color="#3B82F6", width=3))
+                            mode="lines+markers", line=dict(color="#3B82F6", width=3))
             fig.update_layout(
                 paper_bgcolor="#1E293B", plot_bgcolor="#1E293B",
                 font=dict(color="#F1F5F9"), barmode="group",
@@ -189,18 +454,17 @@ with tab_dash:
             )
             st.plotly_chart(fig, use_container_width=True)
         except ImportError:
-            st.info("Instale plotly para ver graficos: pip install plotly")
             st.bar_chart({"Receita": [38000, 41000, 39500, 43000, 40200, 45200],
                           "Despesas": [29000, 31000, 27500, 30000, 29500, 28100]})
 
     with col_table:
-        st.markdown("#### 📋 Ultimas Transacoes")
+        st.markdown("#### 📋 Últimas Transações")
         import pandas as pd
         transacoes = pd.DataFrame({
-            "Data":       ["05/03", "04/03", "03/03", "02/03", "01/03"],
-            "Descricao":  ["Venda Produto A", "Servico B", "Fornecedor C", "Marketing", "Salarios"],
-            "Valor":      ["+R$8.500", "+R$3.200", "-R$4.100", "-R$2.800", "-R$15.000"],
-            "Tipo":       ["Entrada", "Entrada", "Saida", "Saida", "Saida"]
+            "Data":      ["05/03", "04/03", "03/03", "02/03", "01/03"],
+            "Descrição": ["Venda Produto A", "Serviço B", "Fornecedor C", "Marketing", "Salários"],
+            "Valor":     ["+R$8.500", "+R$3.200", "-R$4.100", "-R$2.800", "-R$15.000"],
+            "Tipo":      ["Entrada", "Entrada", "Saída", "Saída", "Saída"]
         })
         st.dataframe(transacoes, use_container_width=True, hide_index=True)
 
@@ -208,197 +472,338 @@ with tab_dash:
     st.markdown("### 🤖 Atividade Recente dos Agentes")
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        st.info("**🔵 Archie-Solomon (CEO)** — Gerou relatorio executivo de fevereiro")
+        st.info("**🔵 Archie-Solomon (CEO)** — Gerou relatório executivo de fevereiro")
     with col_b:
-        st.success("**🟢 Finley-Midas (CFO)** — Atualizou projecao de caixa para marco")
+        st.success("**🟢 Finley-Midas (CFO)** — Atualizou projeção de caixa para março")
     with col_c:
-        st.warning("**🔵 Xara-Iris (CMO+RH)** — Identificou tendencia alta no setor tech")
+        st.warning("**🔵 Xara-Iris (CMO+RH)** — Identificou tendência alta no setor tech")
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════
 # TAB 2 — CHAT COM AGENTES
-# ══════════════════════════════════════════════════════════════════════════════
+# Layout: input no TOPO → mensagens do mais recente ao mais antigo
+# ════════════════════════════════════════════════════════════════
 with tab_chat:
-    st.markdown("### 💬 Fale com o Time de Agentes")
 
+    # ── Seletor de agente ─────────────────────────────────────
     agente_selecionado = st.selectbox(
-        "Escolha o agente para conversar:",
-        ["🏢 Equipe Completa (todos colaboram)",
-         "🔵 Archie-Solomon — CEO / Decisoes Estrategicas",
-         "🟢 Finley-Midas — CFO / Analise Financeira",
-         "🔵 Xara-Iris — CMO / Marketing, Tendencias e RH",
-         "🔴 Shield-Michael — T.I / Seguranca e Backups",
-         "🟡 Memo-Engram — Memoria / Historico da Empresa",
-         "🟣 Nexus-Apollo — Auto-Aprimoramento do Sistema",
-         "🔵 Henrio-Julia — Assistente Pessoal",
-         "⚪ Nexo-Link Vector — Integracoes e APIs"]
+        "Conversar com:",
+        [
+            "🏢 Equipe Completa (todos colaboram)",
+            "🔵 Archie-Solomon — CEO / Decisões Estratégicas",
+            "🟢 Finley-Midas — CFO / Análise Financeira",
+            "🔵 Xara-Iris — CMO / Marketing, Tendências e RH",
+            "🔴 Shield-Michael — T.I / Segurança e Backups",
+            "🟡 Memo-Engram — Memória / Histórico da Empresa",
+            "🟣 Nexus-Apollo — Auto-Aprimoramento do Sistema",
+            "🔵 Henrio-Julia — Assistente Pessoal",
+            "⚪ Nexo-Link Vector — Integrações e APIs",
+        ],
+        label_visibility="collapsed",
     )
 
-    chat_container = st.container()
-    with chat_container:
-        if not st.session_state.messages:
-            st.info(
-                "👋 Ola, Henrique! Eu sou a **Henrio-Julia**, sua assistente pessoal da Arch Company. "
-                "Toda a equipe esta pronta para ajudar. O que voce precisa hoje?\n\n"
-                "Exemplos do que voce pode perguntar:\n"
-                "- *Como foi o desempenho financeiro de fevereiro?*\n"
-                "- *Quais sao as tendencias de mercado para meu setor?*\n"
-                "- *Gere um relatorio executivo da semana*\n"
-                "- *Shield-Michael, como estao nossos backups?*\n"
-                "- *Iris e Apollo, precisamos de um novo agente de vendas?*"
+    # ── BARRA DE CONVERSA NO TOPO ─────────────────────────────
+    st.markdown("#### 💬 Nova Mensagem")
+    with st.form("chat_form", clear_on_submit=True):
+        prompt_input = st.text_area(
+            "",
+            placeholder=(
+                "Digite sua mensagem...\n"
+                "Use @NomeAgente para mencionar e acionar um agente específico nesta mensagem."
+            ),
+            height=90,
+            key="msg_area",
+            label_visibility="collapsed",
+        )
+        col_hint, col_btn = st.columns([5, 1])
+        with col_hint:
+            st.caption(
+                "Dica de @menções: @Archie-Solomon | @Finley-Midas | @Xara-Iris | "
+                "@Shield-Michael | @Memo-Engram | @Nexus-Apollo | @Henrio-Julia | @Nexo-Link"
             )
+        with col_btn:
+            enviado = st.form_submit_button("➤ Enviar", use_container_width=True)
 
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+    st.markdown("---")
 
-    if prompt := st.chat_input("Pergunte para o time de agentes..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # ── PROCESSAR ENVIO ───────────────────────────────────────
+    if enviado and prompt_input.strip():
+        prompt = prompt_input.strip()
+        ts_agora = datetime.now().strftime("%H:%M")
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        # Detectar @menções (têm prioridade sobre o selectbox)
+        mencoes = extrair_mencoes(prompt)
+        agente_key = mencoes[0] if mencoes else agente_da_selecao(agente_selecionado)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Agentes trabalhando..."):
-                if not os.environ.get("ANTHROPIC_API_KEY"):
-                    resposta = (
-                        f"**[Henrio-Julia — Modo Demo]**\n\n"
-                        f"Recebi sua pergunta: *'{prompt}'*\n\n"
-                        f"Para ativar os agentes reais, adicione sua API Key "
-                        f"do Claude na sidebar. No momento estou em modo demonstracao.\n\n"
-                        f"*Quando ativado, Finley-Midas (CFO) vai buscar seus dados do Google Drive, "
-                        f"Archie-Solomon (CEO) vai analisar e eu vou trazer a resposta com contexto "
-                        f"completo do historico da empresa.*"
+        # Label visual da mensagem do usuário
+        if mencoes:
+            label_usuario = f"📣 @{NOME_DISPLAY[agente_key]}"
+        else:
+            label_usuario = f"Para: {ICONE_AGENTE.get(agente_key, '')} {NOME_DISPLAY.get(agente_key, agente_key)}"
+
+        # Adiciona mensagem do usuário ao histórico
+        st.session_state.messages.append({
+            "role":       "user",
+            "content":    f"**[{label_usuario}]** {prompt}",
+            "prompt_raw": prompt,
+            "agente":     agente_key,
+            "timestamp":  ts_agora,
+        })
+
+        # ── GERAR RESPOSTA ────────────────────────────────────
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            resposta = (
+                f"**[Henrio-Julia — Modo Demo]**\n\n"
+                f"Recebi: *'{prompt}'*\n\n"
+                f"Para ativar os agentes reais, adicione sua **Anthropic API Key** na sidebar à esquerda."
+            )
+            agente_resp_key = "henrio"
+        else:
+            try:
+                import anthropic
+                cliente = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+                # Histórico para contexto (exclui a última mensagem que acabou de ser adicionada)
+                historico_ctx = st.session_state.messages[:-1]
+
+                with st.spinner(f"⏳ {NOME_DISPLAY.get(agente_key, 'Agentes')} está processando..."):
+                    resposta = obter_resposta_agente(
+                        agente_key=agente_key,
+                        prompt=prompt,
+                        historico=historico_ctx,
+                        cliente_anthropic=cliente,
                     )
-                else:
+                agente_resp_key = agente_key
+
+            except Exception as e:
+                resposta = f"Erro ao conectar com o agente: {str(e)}\n\nVerifique sua API Key."
+                agente_resp_key = agente_key
+
+        # Adiciona resposta ao histórico
+        icone = ICONE_AGENTE.get(agente_resp_key, "🤖")
+        nome_resp = NOME_DISPLAY.get(agente_resp_key, agente_resp_key)
+        st.session_state.messages.append({
+            "role":      "assistant",
+            "content":   f"**[{icone} {nome_resp}]** {resposta}",
+            "agente":    agente_resp_key,
+            "timestamp": datetime.now().strftime("%H:%M"),
+        })
+
+        # Salva conversa completa na memória
+        if MEMORIA_ATIVA:
+            try:
+                salvar_memoria(
+                    conteudo=(
+                        f"[{datetime.now().strftime('%d/%m/%Y %H:%M')}] "
+                        f"Henrique → {nome_resp}: {prompt}\n"
+                        f"{nome_resp}: {resposta}"
+                    ),
+                    tipo="conversa",
+                    agente=agente_resp_key,
+                )
+            except Exception:
+                pass
+
+        # ── Detectar nomes sem @ na mensagem do usuário ───────
+        nomes_citados = detectar_nomes_sem_arroba(prompt, agente_key)
+        if nomes_citados and not mencoes:
+            # Só guarda o primeiro mencionado para não sobrecarregar
+            st.session_state.notif_pendente = {
+                "agente_key":   nomes_citados[0],
+                "agente_atual": agente_key,
+                "contexto": (
+                    f"Henrique estava conversando com {NOME_DISPLAY.get(agente_key)} "
+                    f"e mencionou seu nome. Contexto da conversa: '{prompt}'. "
+                    f"Você foi chamado para contribuir. Responda em português."
+                ),
+            }
+
+    # ── NOTIFICAÇÃO PENDENTE ─────────────────────────────────
+    if st.session_state.notif_pendente:
+        notif = st.session_state.notif_pendente
+        agente_citado    = NOME_DISPLAY[notif["agente_key"]]
+        agente_que_fala  = NOME_DISPLAY.get(notif["agente_atual"], "Agente")
+
+        st.warning(
+            f"💬 **{agente_que_fala}** notou que você mencionou **{agente_citado}** na conversa. "
+            f"Deseja que eu o notifique para que ele responda?"
+        )
+        col_sim, col_nao, _ = st.columns([1, 1, 5])
+        with col_sim:
+            if st.button("✅ Sim, notificar", key="notif_sim"):
+                if os.environ.get("ANTHROPIC_API_KEY"):
                     try:
                         import anthropic
-                        cliente = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-                        if "Archie" in agente_selecionado:
-                            system = "Voce e Archie-Solomon, o CEO da Arch Company. Seu nome honra Salomao — o rei mais sabio da historia. Tome decisoes estrategicas com sabedoria e integridade. Prefira o caminho certo ao caminho rapido. Seja visionario, direto e motivador. Responda em portugues."
-                            model_id = "claude-opus-4-5-20251101"
-                        elif "Finley" in agente_selecionado:
-                            system = "Voce e Finley-Midas, o CFO da Arch Company. Seu nome honra o rei Midas — tudo que toca vira ouro. Analise financas, DRE, fluxo de caixa e projecoes com precisao e transparencia. Busque a prosperidade sustentavel. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-                        elif "Xara" in agente_selecionado:
-                            system = "Voce e Xara-Iris, a CMO e responsavel por RH da Arch Company. Seu nome honra Iris — mensageira dos deuses, que conecta mundos. Crie estrategias de marketing, analise tendencias e gerencie o time de agentes. Quando surgir ideia de novo agente, debata com Nexus-Apollo antes de recomendar. Seja criativa e orientada a resultados. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-                        elif "Shield" in agente_selecionado:
-                            system = "Voce e Shield-Michael, o responsavel por T.I, seguranca e backups da Arch Company. Seu nome honra o arcanjo Michael — guerreiro e protetor. Cuide dos backups do ChromaDB, integridade dos dados financeiros, pontos de retorno e saude do sistema. Nunca deve haver perda de informacao. Seja tecnico, preciso e vigilante. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-                        elif "Memo" in agente_selecionado:
-                            contexto_historico = ""
-                            if MEMORIA_ATIVA:
-                                contexto_historico = formatar_contexto_memo(prompt)
-                            system = (
-                                "Voce e Memo-Engram, o agente de memoria e conhecimento da Arch Company. "
-                                "Engram e o traco fisico de uma memoria no cerebro — voce nunca esquece. "
-                                "Voce nao apenas armazena: voce ensina. Contextualize o passado, explique padroes, "
-                                "eduque com base no que foi vivido pela empresa. "
-                                "Responda com base nas memorias abaixo (quando disponiveis). "
-                                "Seja organizado, preciso e didatico. Responda em portugues.\n\n"
-                                + contexto_historico
-                            )
-                            model_id = "claude-haiku-4-5-20251001"
-                        elif "Nexus" in agente_selecionado:
-                            system = "Voce e Nexus-Apollo, o agente de auto-aprimoramento da Arch Company. Seu nome honra Apollo — deus do conhecimento e da razao. Analise o sistema, identifique gargalos e sugira melhorias continuas. Quando surgir ideia de novo agente, debata com Xara-Iris: voce traz a visao evolutiva, ela traz a visao organizacional. Seja analitico e filosofico. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-                        elif "Henrio" in agente_selecionado:
-                            system = "Voce e Henrio-Julia, a assistente pessoal do Henrique Adams na Arch Company. Julia significa 'jovem, cheia de energia vital'. Voce e feminina, acolhedora e sempre presente. Conhece bem o Henrique, seus objetivos e rotina. Antecipe o que ele precisa. Seja prestativa, amigavel e proativa. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-                        elif "Nexo" in agente_selecionado:
-                            system = "Voce e Nexo-Link Vector, o agente de integracoes da Arch Company. Link Vector e o caminho pelo qual tudo se move entre sistemas. Especialista em conectar mundos: Google Drive, Sheets, WhatsApp, Notion e outras APIs. Explique integracoes de forma pratica e com exemplos concretos. Responda em portugues."
-                            model_id = "claude-haiku-4-5-20251001"
-                        else:
-                            system = "Voce representa o time completo da Arch Company: Archie-Solomon (CEO), Finley-Midas (CFO), Xara-Iris (CMO+RH), Shield-Michael (T.I), Memo-Engram (Memoria), Nexus-Apollo (Auto-melhoria), Henrio-Julia (Assistente Pessoal) e Nexo-Link Vector (Integracoes). Todos guiados por sabedoria, integridade e diligencia. Coordene as perspectivas e apresente uma resposta unificada. Responda em portugues."
-                            model_id = "claude-sonnet-4-5-20250929"
-
-                        mensagem = cliente.messages.create(
-                            model=model_id,
-                            max_tokens=1024,
-                            system=system,
-                            messages=[{"role": "user", "content": prompt}]
+                        c2 = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+                        system_notif = construir_system_prompt(notif["agente_key"])
+                        resp_notif = c2.messages.create(
+                            model=MODEL_AGENTE.get(notif["agente_key"], "claude-sonnet-4-5-20250929"),
+                            max_tokens=512,
+                            system=system_notif,
+                            messages=[{"role": "user", "content": notif["contexto"]}],
                         )
-                        resposta = mensagem.content[0].text
-
+                        texto_notif = resp_notif.content[0].text
+                        icone_n = ICONE_AGENTE.get(notif["agente_key"], "🤖")
+                        st.session_state.messages.append({
+                            "role":      "assistant",
+                            "content":   f"**[📣 {icone_n} {agente_citado} — notificado]** {texto_notif}",
+                            "agente":    notif["agente_key"],
+                            "timestamp": datetime.now().strftime("%H:%M"),
+                        })
+                        # Salva na memória do agente citado
                         if MEMORIA_ATIVA:
                             try:
-                                nome_agente = agente_selecionado.split("—")[0].strip().split()[-1].lower()
                                 salvar_memoria(
-                                    conteudo=f"Pergunta: {prompt}\nResposta de {nome_agente}: {resposta}",
+                                    conteudo=f"Fui chamado por {agente_que_fala} via menção. Contexto: {notif['contexto']}\nMinha resposta: {texto_notif}",
                                     tipo="conversa",
-                                    agente=nome_agente,
+                                    agente=notif["agente_key"],
                                 )
                             except Exception:
                                 pass
-
                     except Exception as e:
-                        resposta = f"Erro ao conectar com o agente: {str(e)}\n\nVerifique se sua API Key esta correta na sidebar."
+                        st.error(f"Erro ao notificar: {e}")
+                st.session_state.notif_pendente = None
+                st.rerun()
+        with col_nao:
+            if st.button("❌ Não, obrigado", key="notif_nao"):
+                st.session_state.notif_pendente = None
+                st.rerun()
 
-                st.markdown(resposta)
-                st.session_state.messages.append({"role": "assistant", "content": resposta})
+    # ── EXIBIR MENSAGENS (mais recente no topo) ───────────────
+    if not st.session_state.messages:
+        st.info(
+            "👋 Olá, Henrique! Eu sou a **Henrio-Julia**, sua assistente pessoal da Arch Company.\n\n"
+            "Toda a equipe está pronta para ajudar. Use o campo acima para enviar sua mensagem.\n\n"
+            "**Dicas:**\n"
+            "- Use **@NomeAgente** para acionar um agente específico diretamente\n"
+            "- Mencione um agente sem @ durante uma conversa e eu pergunto se deve notificá-lo\n"
+            "- Selecione 'Equipe Completa' para uma resposta colaborativa"
+        )
+    else:
+        col_lim, _ = st.columns([1, 5])
+        with col_lim:
+            if st.button("🗑️ Limpar conversa", key="limpar_conv"):
+                st.session_state.messages = []
+                st.session_state.notif_pendente = None
+                st.rerun()
 
-    if st.button("🗑️ Limpar Conversa"):
-        st.session_state.messages = []
-        st.rerun()
+        # Mensagens em ordem reversa — mais recente primeiro (logo abaixo da barra)
+        for msg in reversed(st.session_state.messages):
+            ts = msg.get("timestamp", "")
+            with st.chat_message(msg["role"]):
+                if ts:
+                    st.caption(f"🕐 {ts}")
+                st.markdown(msg["content"])
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════
 # TAB 3 — GERENCIAR AGENTES
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 with tab_agentes:
     st.markdown("### 🤖 Painel de Controle dos Agentes")
 
-    for ag in agentes:
-        with st.expander(f"{ag['cor']} #{ag['num']} — **{ag['nome']}** | {ag['cargo']} | {ag['status']}"):
-            col_info, col_actions = st.columns([3, 1])
+    # Estatísticas de memória por agente
+    mem_stats = {}
+    if MEMORIA_ATIVA:
+        try:
+            mem_stats = stats_memorias()
+        except Exception:
+            pass
+
+    for ag in agentes_lista:
+        key_ag = ag["nome"].split("-")[0].lower()
+        n_mem = mem_stats.get(key_ag, 0)
+        with st.expander(
+            f"{ag['cor']} #{ag['num']} — **{ag['nome']}** | {ag['cargo']} | {ag['status']}"
+        ):
+            col_info, col_mem, col_actions = st.columns([2, 2, 1])
             with col_info:
                 st.markdown(f"**Modelo:** {ag['modelo']}")
                 st.markdown(f"**Status:** {ag['status']}")
+            with col_mem:
+                st.markdown(f"**Memórias próprias:** {n_mem}")
+                st.markdown(f"**Pasta:** `memoria_arch_company/{key_ag}/`")
             with col_actions:
                 if ag["status"] == "Ativo":
-                    if st.button(f"⏸ Pausar", key=f"pause_{ag['num']}"):
+                    if st.button("⏸ Pausar", key=f"pause_{ag['num']}"):
                         st.warning(f"{ag['nome']} pausado")
                 else:
-                    if st.button(f"▶ Ativar", key=f"activate_{ag['num']}"):
+                    if st.button("▶ Ativar", key=f"activate_{ag['num']}"):
                         st.success(f"{ag['nome']} ativado")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — CONFIGURACOES
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_config:
-    st.markdown("### 🔧 Configuracoes do Sistema")
 
-    st.markdown("#### 📋 Checklist de Configuracao")
+# ════════════════════════════════════════════════════════════════
+# TAB 4 — CONFIGURAÇÕES
+# ════════════════════════════════════════════════════════════════
+with tab_config:
+    st.markdown("### 🔧 Configurações do Sistema")
+
+    # Segurança
+    st.markdown("#### 🔐 Senha de Acesso (Intranet)")
+    st.info(
+        "A senha é definida pela variável de ambiente `DASHBOARD_PASSWORD` no Railway.\n\n"
+        "**Para alterar:**\n"
+        "Railway → seu serviço → Variables → `DASHBOARD_PASSWORD` = sua-nova-senha\n\n"
+        f"Senha padrão se não configurada: `archcompany2026`"
+    )
+
+    st.markdown("---")
+
+    # Memória
+    st.markdown("#### 🧠 Memória Persistente (Railway Volume)")
+    mem_path_atual = os.environ.get("MEMORY_PATH", "./memoria_arch_company")
+    st.code(f"MEMORY_PATH atual: {mem_path_atual}", language="bash")
+    st.info(
+        "**Para memória persistente entre deploys no Railway:**\n\n"
+        "1. Railway Dashboard → seu serviço → **Settings → Volumes**\n"
+        "2. Criar volume e montar em: `/data/memory`\n"
+        "3. Adicionar variável de ambiente: `MEMORY_PATH=/data/memory`\n\n"
+        "**Estrutura de pastas da memória:**\n"
+        "```\n"
+        "/data/memory/\n"
+        "  archie/   → memória privada do Archie-Solomon\n"
+        "  finley/   → memória privada do Finley-Midas\n"
+        "  xara/     → memória privada da Xara-Iris\n"
+        "  shield/   → memória privada do Shield-Michael\n"
+        "  memo/     → memória privada do Memo-Engram\n"
+        "  nexus/    → memória privada do Nexus-Apollo\n"
+        "  henrio/   → memória privada da Henrio-Julia\n"
+        "  nexo/     → memória privada do Nexo-Link Vector\n"
+        "  shared/   → memória compartilhada (todos acessam)\n"
+        "```\n"
+        "Sem o volume, a memória é resetada a cada redeploy."
+    )
+
+    if MEMORIA_ATIVA:
+        st.markdown("#### 📊 Estatísticas de Memória por Agente")
+        try:
+            stats = stats_memorias()
+            cols = st.columns(4)
+            for i, (agente_k, count) in enumerate(stats.items()):
+                if agente_k in NOME_DISPLAY:
+                    with cols[i % 4]:
+                        st.metric(NOME_DISPLAY[agente_k], f"{count} memórias")
+        except Exception as e:
+            st.warning(f"Não foi possível carregar estatísticas: {e}")
+
+    st.markdown("---")
+    st.markdown("#### 📋 Checklist de Configuração")
     steps = [
         ("API Key Anthropic (Claude)", bool(os.environ.get("ANTHROPIC_API_KEY"))),
         ("API Key xAI (Grok)",         bool(os.environ.get("XAI_API_KEY"))),
+        ("Senha do dashboard",         bool(os.environ.get("DASHBOARD_PASSWORD"))),
+        ("Memória persistente (Volume)", bool(os.environ.get("MEMORY_PATH"))),
         ("Google Drive conectado",     False),
-        ("ChromaDB inicializado",      False),
-        ("Primeiro agente testado",    False),
     ]
     for step, done in steps:
-        icon = "✅" if done else "⬜"
-        st.markdown(f"{icon} {step}")
+        st.markdown(f"{'✅' if done else '⬜'} {step}")
 
     st.markdown("---")
-    st.markdown("#### 🚀 Proximos Passos para Ativar o Sistema Real")
-    st.code("""
-# 1. Instale as dependencias
-pip install streamlit crewai anthropic chromadb gspread
-pip install google-auth google-auth-oauthlib plotly pandas
-
-# 2. Configure as API Keys
-export ANTHROPIC_API_KEY="sua-key-aqui"
-export XAI_API_KEY="sua-key-aqui"
-
-# 3. Execute o dashboard
-streamlit run app.py
-
-# 4. Para conectar o Google Drive, baixe o credentials.json
-#    em console.cloud.google.com e coloque na pasta do projeto
-    """, language="bash")
-
-    st.info(
-        "📄 **Consulte o documento ArchCompany_Sistema_IA_Completo.docx** "
-        "para o passo a passo completo de configuracao e o codigo dos agentes."
+    st.markdown("#### 🚀 Variáveis de ambiente no Railway")
+    st.code(
+        "ANTHROPIC_API_KEY  = sk-ant-api03-...\n"
+        "XAI_API_KEY        = xai-...\n"
+        "DASHBOARD_PASSWORD = sua-senha-segura\n"
+        "MEMORY_PATH        = /data/memory   ← após criar o Volume",
+        language="bash"
     )
