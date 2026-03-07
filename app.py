@@ -120,21 +120,19 @@ if not st.session_state.autenticado:
         try:
             import streamlit_oauth
             token = streamlit_oauth.OAuth2Component(
-                client_id=os.environ.get("GOOGLE_CLIENT_ID"),
-                client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
-                authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
-                token_endpoint="https://oauth2.googleapis.com/token",
-                refresh_token_endpoint="https://oauth2.googleapis.com/token",
-                revoke_endpoint="https://oauth2.googleapis.com/revoke",
-                client_kwargs=dict(scope=["email", "profile"]),
-                is_local=False,
-            ).authorize_button(
-                name="sign_in_with",
-                icon="https://www.gstatic.com/firebaseapp.com/images/firebaselogo.png",
-                redirect_uri="https://web-production-c201.up.railway.app/",
-                key="google_oauth",
-                pkce="S256",
-            )
+client_id=os.environ.get("GOOGLE_CLIENT_ID"),
+client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
+authorize_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+token_endpoint="https://oauth2.googleapis.com/token",
+refresh_token_endpoint="https://oauth2.googleapis.com/token",
+).authorize_button(
+name="sign_in_with",
+icon="https://www.gstatic.com/firebaseapp.com/images/firebaselogo.png",
+redirect_uri="https://web-production-c201.up.railway.app/",
+scope="openid email profile",
+key="google_oauth",
+pkce="S256",
+)
 
             if token:
                 email = token["userinfo"]["email"]
